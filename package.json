@@ -7,11 +7,12 @@
     "node": ">=22"
   },
   "scripts": {
+    "dev": "pnpm --filter @eaiku/web dev",
+    "build:web": "pnpm --filter @eaiku/web build",
     "test": "vitest run --passWithNoTests",
-    "typecheck": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json && tsc -p apps/web/tsconfig.json",
     "lint": "eslint .",
-    "eaiku": "tsx packages/cli/src/main.ts",
-    "prepare": "husky"
+    "eaiku": "tsx packages/cli/src/main.ts"
   },
   "pnpm": {
     "onlyBuiltDependencies": [

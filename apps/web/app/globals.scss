@@ -1,0 +1,77 @@
+:root {
+  --bg: #0b0c10;
+  --glow-1: rgba(139, 92, 246, 0.32);
+  --glow-2: rgba(45, 212, 191, 0.22);
+  --surface: rgba(255, 255, 255, 0.05);
+  --surface-strong: rgba(255, 255, 255, 0.09);
+  --border: rgba(255, 255, 255, 0.12);
+  --text: #eef0f6;
+  --muted: #9ba3b4;
+  --accent: #7df9c9;
+  --accent-ink: #052b1f;
+  --radius-sm: 10px;
+  --radius: 18px;
+  --radius-lg: 28px;
+  --blur: 18px;
+  --header-h: 72px;
+  --font-display: "Bricolage Grotesque Variable", system-ui, sans-serif;
+  --font-body: "Inter Variable", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, monospace;
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+}
+
+body {
+  min-height: 100dvh;
+  background:
+    radial-gradient(60vw 60vw at 5% -15%, var(--glow-1), transparent 60%),
+    radial-gradient(50vw 50vw at 105% 5%, var(--glow-2), transparent 60%),
+    var(--bg);
+  background-attachment: fixed;
+  color: var(--text);
+  font-family: var(--font-body);
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--font-display);
+  letter-spacing: -0.02em;
+  line-height: 1.15;
+}
+
+a {
+  color: inherit;
+}
+
+::selection {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+
+// Shared glass panel. Plugin components add it next to their module class.
+.glass {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  backdrop-filter: blur(var(--blur));
+  -webkit-backdrop-filter: blur(var(--blur));
+}
+
+// Page body below the fixed header.
+.page-main {
+  padding: calc(var(--header-h) + 24px) clamp(16px, 4vw, 40px) 64px;
+  max-width: 1200px;
+  margin: 0 auto;
+}
