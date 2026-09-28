@@ -192,7 +192,12 @@ Expected: install succeeds and `pnpm-lock.yaml` exists.
 Run: `pnpm test && pnpm lint`
 Expected: both exit 0. Vitest prints "No test files found, exiting with code 0".
 
-Do not run `pnpm typecheck` yet. With no `.ts` files, `tsc` fails with "TS18003: No inputs were found". It works from Task 3.
+`pnpm typecheck` also exits 0, because `tsconfig.json` includes `vitest.config.ts`.
+
+Version pins found during execution (2026-09-28):
+- `typescript@~6.0`: TypeScript 7 is out, but `typescript-eslint` 8.70 supports only `<6.1.0`.
+- `@types/node@22`: match the Node version in the spec.
+- `packageManager: pnpm@10.34.5`: Corepack 0.34 cannot run pnpm 12. Install with `corepack install -g pnpm@10`.
 
 - [ ] **Step 4: Commit (on `main`)**
 

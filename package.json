@@ -10,7 +10,8 @@
     "test": "vitest run --passWithNoTests",
     "typecheck": "tsc -p tsconfig.json",
     "lint": "eslint .",
-    "eaiku": "tsx packages/cli/src/main.ts"
+    "eaiku": "tsx packages/cli/src/main.ts",
+    "prepare": "husky"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
@@ -19,8 +20,14 @@
     ]
   },
   "devDependencies": {
+    "@commitlint/cli": "^21.2.3",
+    "@commitlint/config-conventional": "^21.2.3",
+    "@semantic-release/changelog": "^7.0.0",
+    "@semantic-release/git": "^11.0.1",
     "@types/node": "^22.20.4",
     "eslint": "^10.11.0",
+    "husky": "^9.1.7",
+    "semantic-release": "^25.0.9",
     "tsx": "^4.23.15",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.70.1",
