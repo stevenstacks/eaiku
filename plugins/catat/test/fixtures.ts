@@ -86,3 +86,13 @@ export function makeNote(overrides: Partial<Note> = {}): Note {
     ...overrides,
   };
 }
+
+// 29:59 of 4-second segments every 5 seconds (1-second pauses), with two longer pauses:
+// 4 seconds before 10:10 and 3 seconds before 19:55. No chapters.
+export function makeLongTranscript(): TranscriptFile {
+  const long: Segment[] = [];
+  for (let t = 0; t < 1800; t += 5) {
+    long.push({ startSec: t, durSec: t === 605 ? 1 : t === 1190 ? 2 : 4, text: `line at ${t}` });
+  }
+  return { ...transcript, durationSec: 1799, chapters: [], segments: long };
+}
