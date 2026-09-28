@@ -50,13 +50,14 @@ eaiku/
    │  ├─ chapters.ts                 parseChapters (pure)
    │  ├─ youtube.ts                  the ONLY file that calls YouTube / youtube-transcript
    │  ├─ snap.ts                     snapCut, buildParts
+   │  ├─ plan.ts                     computePlan (single / chapters / grid + buffer), checkSeriesRange
    │  └─ citations.ts                checkCitations
    ├─ db/
    │  ├─ migrations/0001_init.sql
    │  ├─ tables.ts                   Drizzle tables
-   │  └─ index.ts                    MIGRATIONS_DIR, indexNote, clearIndex
-   ├─ cli/ shared.ts, fetch.ts, plan.ts, save.ts, reindex.ts
-   ├─ scripts/smoke.ts               Day 1 live checks
+   │  └─ index.ts                    MIGRATIONS_DIR, indexNote, clearIndex, getSeriesParts
+   ├─ cli/ shared.ts, fetch.ts, plan.ts, read.ts, save.ts, reindex.ts
+   ├─ scripts/smoke.ts, preview.ts   Day 1 live checks, transcript preview
    ├─ test/fixtures.ts
    └─ claude/
       ├─ .claude-plugin/plugin.json
@@ -1852,7 +1853,7 @@ import { createContext } from "@eaiku/core";
 import { makeTempHome } from "@eaiku/core/testing";
 import { describe, expect, it } from "vitest";
 import { makeNote } from "../test/fixtures";
-import { clearIndex, indexNote, MIGRATIONS_DIR } from "./index";
+import { clearIndex, getSeriesParts, indexNote, MIGRATIONS_DIR } from "./index";
 
 function setup() {
   return createContext({ id: "catat", migrationsDir: MIGRATIONS_DIR }, makeTempHome());
@@ -1883,6 +1884,28 @@ describe("indexNote", () => {
     expect(db.prepare("SELECT count(*) AS n FROM catat_notes").get()).toEqual({ n: 1 });
     expect(db.prepare("SELECT tag FROM catat_note_tags").all()).toEqual([{ tag: "new" }]);
     expect(db.prepare("SELECT count(*) AS n FROM catat_notes_fts").get()).toEqual({ n: 1 });
+  });
+
+  it("getSeriesParts returns the saved parts of a series, without the excluded note", () => {
+    const { db } = setup();
+    const base = makeNote();
+    if (base.source.type !== "youtube") throw new Error("fixture must be youtube");
+    const part = (n: number, startSec: number, endSec: number) =>
+      makeNote({
+        id: `tokens-p${n}`,
+        source: { ...base.source, range: { startSec, endSec } },
+        series: { id: "abcdefghijk", part: n, total: 3, partTitle: `Part ${n}` },
+      });
+    indexNote(db, part(2, 30, 60), "/x/2.json");
+    indexNote(db, part(1, 0, 30), "/x/1.json");
+
+    expect(getSeriesParts(db, "abcdefghijk")).toEqual([
+      { id: "tokens-p1", part: 1, startSec: 0, endSec: 30 },
+      { id: "tokens-p2", part: 2, startSec: 30, endSec: 60 },
+    ]);
+    expect(getSeriesParts(db, "abcdefghijk", "tokens-p2")).toEqual([
+      { id: "tokens-p1", part: 1, startSec: 0, endSec: 30 },
+    ]);
   });
 
   it("clearIndex empties all catat tables", () => {
@@ -1986,12 +2009,30 @@ export function indexNote(sqlite: Sqlite, note: Note, notePath: string): void {
 export function clearIndex(sqlite: Sqlite): void {
   sqlite.exec("DELETE FROM catat_note_tags; DELETE FROM catat_notes; DELETE FROM catat_notes_fts;");
 }
+
+export interface SavedPart {
+  id: string;
+  part: number;
+  startSec: number;
+  endSec: number;
+}
+
+// Saved parts of one video, in part order. `plan` uses them so the next part starts where
+// the saved part really ended (no overlap from the 5-minute buffer).
+export function getSeriesParts(sqlite: Sqlite, seriesId: string, excludeNoteId?: string): SavedPart[] {
+  const rows = sqlite
+    .prepare(
+      "SELECT id, part, start_sec AS startSec, end_sec AS endSec FROM catat_notes WHERE series_id = ? AND part IS NOT NULL ORDER BY part",
+    )
+    .all(seriesId) as SavedPart[];
+  return rows.filter((row) => row.id !== excludeNoteId);
+}
 ```
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `pnpm vitest run plugins/catat/db && pnpm typecheck`
-Expected: PASS (3 tests), and typecheck exits 0.
+Expected: PASS (4 tests), and typecheck exits 0.
 
 - [ ] **Step 6: Commit**
 
@@ -2002,15 +2043,227 @@ git commit -m "feat(catat): index notes in SQLite with full-text search"
 
 ---
 
-### Task 12: CLI commands `fetch` and `plan`
+### Task 12: Plan logic and the `fetch`, `plan`, and `read` commands
 
 **Files:**
-- Create: `plugins/catat/cli/shared.ts`, `plugins/catat/cli/fetch.ts`, `plugins/catat/cli/plan.ts`
-- Test: `plugins/catat/cli/plan.test.ts`
+- Create: `plugins/catat/lib/plan.ts`, `plugins/catat/cli/shared.ts`, `plugins/catat/cli/fetch.ts`, `plugins/catat/cli/plan.ts`, `plugins/catat/cli/read.ts`
+- Modify: `plugins/catat/test/fixtures.ts`
+- Test: `plugins/catat/lib/plan.test.ts`, `plugins/catat/cli/plan.test.ts`, `plugins/catat/cli/read.test.ts`
+
+The plan has three modes (spec §7, step 2):
+- `single`: the video is 10 minutes or shorter. One note.
+- `chapters`: longer, with 2 or more chapters. One part per chapter, no buffer.
+- `grid`: longer, no chapters. A cut every 10 minutes, snapped to a pause (±2 min). Each part may run up to 5 minutes past its planned end (`readUntilSec`). A saved part keeps its saved range, and the next part starts at its saved end.
 
 `fetch` has no unit test because it only joins tested pieces with network calls. Task 17 checks it live.
 
-- [ ] **Step 1: Write the failing test for `plan`**
+- [ ] **Step 1: Add a long transcript fixture**
+
+Append to `plugins/catat/test/fixtures.ts`:
+
+```ts
+// 29:59 of 4-second segments every 5 seconds (1-second pauses), with two longer pauses:
+// 4 seconds before 10:10 and 3 seconds before 19:55. No chapters.
+export function makeLongTranscript(): TranscriptFile {
+  const long: Segment[] = [];
+  for (let t = 0; t < 1800; t += 5) {
+    long.push({ startSec: t, durSec: t === 605 ? 1 : t === 1190 ? 2 : 4, text: `line at ${t}` });
+  }
+  return { ...transcript, durationSec: 1799, chapters: [], segments: long };
+}
+```
+
+- [ ] **Step 2: Write the failing test for the plan logic**
+
+`plugins/catat/lib/plan.test.ts`:
+
+```ts
+import { describe, expect, it } from "vitest";
+import { makeLongTranscript, makeNote, transcript } from "../test/fixtures";
+import { checkSeriesRange, computePlan } from "./plan";
+
+describe("computePlan", () => {
+  it("makes one part for a video of 10 minutes or less", () => {
+    expect(computePlan(transcript)).toEqual({
+      mode: "single",
+      total: 1,
+      parts: [{ part: 1, startSec: 0, endSec: 80, readUntilSec: 80 }],
+    });
+  });
+
+  it("uses chapters, with no buffer", () => {
+    const plan = computePlan({
+      ...makeLongTranscript(),
+      chapters: [
+        { title: "Intro", startSec: 0 },
+        { title: "Middle", startSec: 900 },
+      ],
+    });
+    expect(plan).toEqual({
+      mode: "chapters",
+      total: 2,
+      parts: [
+        { part: 1, startSec: 0, endSec: 900, readUntilSec: 900, title: "Intro" },
+        { part: 2, startSec: 900, endSec: 1799, readUntilSec: 1799, title: "Middle" },
+      ],
+    });
+  });
+
+  it("cuts every 10 minutes at the nearest long pause and adds a 5-minute buffer", () => {
+    expect(computePlan(makeLongTranscript())).toEqual({
+      mode: "grid",
+      total: 3,
+      parts: [
+        { part: 1, startSec: 0, endSec: 610, readUntilSec: 910 },
+        { part: 2, startSec: 610, endSec: 1195, readUntilSec: 1495 },
+        { part: 3, startSec: 1195, endSec: 1799, readUntilSec: 1799 },
+      ],
+    });
+  });
+
+  it("starts the next part where the saved part really ended", () => {
+    const plan = computePlan(makeLongTranscript(), [{ id: "p1", part: 1, startSec: 0, endSec: 820 }]);
+    expect(plan.parts.slice(0, 2)).toEqual([
+      { part: 1, startSec: 0, endSec: 820, readUntilSec: 820, savedNoteId: "p1" },
+      { part: 2, startSec: 820, endSec: 1195, readUntilSec: 1495 },
+    ]);
+  });
+});
+
+describe("checkSeriesRange", () => {
+  const plan = computePlan(makeLongTranscript());
+  const base = makeNote();
+  if (base.source.type !== "youtube") throw new Error("fixture must be youtube");
+  const partNote = (startSec: number, endSec: number, part = 1, total = 3) =>
+    makeNote({
+      source: { ...base.source, durationSec: 1799, range: { startSec, endSec } },
+      series: { id: "abcdefghijk", part, total, partTitle: "Intro" },
+    });
+
+  it("accepts a part that ends inside the buffer", () => {
+    expect(checkSeriesRange(partNote(0, 820), plan)).toBeNull();
+  });
+
+  it("rejects a part that ends after the buffer", () => {
+    expect(checkSeriesRange(partNote(0, 1000), plan)).toContain("must end at or before 15:10");
+  });
+
+  it("rejects a part with the wrong start", () => {
+    expect(checkSeriesRange(partNote(600, 900, 2), plan)).toContain("must start at 10:10");
+  });
+
+  it("rejects a wrong total", () => {
+    expect(checkSeriesRange(partNote(0, 820, 1, 5), plan)).toContain("series.total must be 3");
+  });
+
+  it("ignores notes without a series", () => {
+    expect(checkSeriesRange(makeNote(), plan)).toBeNull();
+  });
+});
+```
+
+- [ ] **Step 3: Run the test to verify it fails**
+
+Run: `pnpm vitest run plugins/catat/lib/plan.test.ts`
+Expected: FAIL with "Cannot find module './plan'".
+
+- [ ] **Step 4: Implement the plan logic**
+
+`plugins/catat/lib/plan.ts`:
+
+```ts
+import type { SavedPart } from "../db";
+import type { Note } from "../schema/note";
+import { buildParts, snapCut, type Part } from "./snap";
+import { formatTimestamp } from "./time";
+import type { TranscriptFile } from "./transcript";
+
+export const SINGLE_MAX_SEC = 600;
+export const GRID_SEC = 600;
+export const BUFFER_SEC = 300;
+export const SNAP_WINDOW_SEC = 120;
+
+export interface PlannedPart {
+  part: number;
+  startSec: number;
+  endSec: number; // planned end
+  readUntilSec: number; // planned end + buffer; the note may end anywhere up to here
+  title?: string;
+  savedNoteId?: string;
+}
+
+export interface Plan {
+  mode: "single" | "chapters" | "grid";
+  total: number;
+  parts: PlannedPart[];
+}
+
+type PlanInput = Pick<TranscriptFile, "durationSec" | "segments" | "chapters">;
+
+function baseParts(t: PlanInput): { mode: Plan["mode"]; bufferSec: number; parts: Part[] } {
+  if (t.durationSec <= SINGLE_MAX_SEC) {
+    return { mode: "single", bufferSec: 0, parts: [{ part: 1, startSec: 0, endSec: t.durationSec }] };
+  }
+  if (t.chapters.length >= 2) {
+    const parts = buildParts(
+      t.chapters.map((c) => c.startSec),
+      t.durationSec,
+    ).map((p) => ({ ...p, title: t.chapters.find((c) => c.startSec === p.startSec)?.title }));
+    return { mode: "chapters", bufferSec: 0, parts };
+  }
+  // Stop half a grid step before the end, so the last part is never shorter than 5 minutes.
+  const cuts: number[] = [];
+  for (let c = GRID_SEC; c < t.durationSec - GRID_SEC / 2; c += GRID_SEC) {
+    cuts.push(snapCut(t.segments, c, SNAP_WINDOW_SEC));
+  }
+  return { mode: "grid", bufferSec: BUFFER_SEC, parts: buildParts(cuts, t.durationSec) };
+}
+
+export function computePlan(t: PlanInput, saved: SavedPart[] = []): Plan {
+  const { mode, bufferSec, parts } = baseParts(t);
+  const savedByPart = new Map(saved.map((s) => [s.part, s]));
+
+  let previousEnd = 0;
+  const planned = parts.map((p): PlannedPart => {
+    const s = savedByPart.get(p.part);
+    if (s) {
+      previousEnd = s.endSec;
+      return { ...p, startSec: s.startSec, endSec: s.endSec, readUntilSec: s.endSec, savedNoteId: s.id };
+    }
+    // A saved previous part may have used its buffer. Start where it really ended.
+    const startSec = previousEnd > p.startSec && previousEnd < p.endSec ? previousEnd : p.startSec;
+    previousEnd = p.endSec;
+    return { ...p, startSec, readUntilSec: Math.min(p.endSec + bufferSec, t.durationSec) };
+  });
+  return { mode, total: planned.length, parts: planned };
+}
+
+// Returns a message when a series note does not match the plan, or null when it does.
+export function checkSeriesRange(note: Note, plan: Plan): string | null {
+  if (!note.series || note.source.type !== "youtube") return null;
+  const { series } = note;
+  const { range, videoId } = note.source;
+
+  if (series.id !== videoId) return `series.id must be the videoId "${videoId}".`;
+  if (series.total !== plan.total) return `series.total must be ${plan.total}.`;
+  const part = plan.parts.find((p) => p.part === series.part);
+  if (!part) return `Part ${series.part} does not exist. The plan has ${plan.total} parts.`;
+  if (Math.abs(range.startSec - part.startSec) > 1) {
+    return `Part ${series.part} must start at ${formatTimestamp(part.startSec)} (${part.startSec}s).`;
+  }
+  if (range.endSec > part.readUntilSec + 1) {
+    return `Part ${series.part} must end at or before ${formatTimestamp(part.readUntilSec)} (${part.readUntilSec}s).`;
+  }
+  return null;
+}
+```
+
+- [ ] **Step 5: Run the test to verify it passes**
+
+Run: `pnpm vitest run plugins/catat/lib/plan.test.ts`
+Expected: PASS (9 tests).
+
+- [ ] **Step 6: Write the failing tests for the commands**
 
 `plugins/catat/cli/plan.test.ts`:
 
@@ -2018,58 +2271,81 @@ git commit -m "feat(catat): index notes in SQLite with full-text search"
 import { CommandError, createContext } from "@eaiku/core";
 import { makeTempHome } from "@eaiku/core/testing";
 import { describe, expect, it } from "vitest";
-import { MIGRATIONS_DIR } from "../db";
-import { transcript } from "../test/fixtures";
+import { indexNote, MIGRATIONS_DIR } from "../db";
+import { makeLongTranscript, makeNote } from "../test/fixtures";
 import { planCommand } from "./plan";
 
-async function setup(chapters = transcript.chapters) {
-  const ctx = createContext({ id: "catat", migrationsDir: MIGRATIONS_DIR }, makeTempHome());
-  await ctx.storage.writeJson(`transcripts/${transcript.videoId}.json`, { ...transcript, chapters });
-  return ctx;
+function setup() {
+  return createContext({ id: "catat", migrationsDir: MIGRATIONS_DIR }, makeTempHome());
 }
 
 describe("planCommand", () => {
-  it("snaps --cuts and returns labelled parts", async () => {
-    const ctx = await setup();
-    // 0:20 snaps to 0:40, the segment after the longest pause (26s).
-    expect(await planCommand([transcript.videoId, "--cuts", "0:20"], ctx)).toEqual({
-      videoId: "abcdefghijk",
-      source: "cuts",
-      parts: [
-        { part: 1, startSec: 0, endSec: 40, startLabel: "0:00", endLabel: "0:40" },
-        { part: 2, startSec: 40, endSec: 80, startLabel: "0:40", endLabel: "1:20" },
-      ],
-    });
-  });
+  it("returns a labelled plan whose next part starts after the saved part", async () => {
+    const ctx = setup();
+    const long = makeLongTranscript();
+    await ctx.storage.writeJson(`transcripts/${long.videoId}.json`, long);
+    const base = makeNote();
+    if (base.source.type !== "youtube") throw new Error("fixture must be youtube");
+    indexNote(
+      ctx.db,
+      makeNote({
+        id: "tokens-p1",
+        source: { ...base.source, durationSec: 1799, range: { startSec: 0, endSec: 820 } },
+        series: { id: long.videoId, part: 1, total: 3, partTitle: "Intro" },
+      }),
+      "/x/note.json",
+    );
 
-  it("uses chapters when there are no --cuts", async () => {
-    const ctx = await setup([
-      { title: "Intro", startSec: 0 },
-      { title: "Numbers", startSec: 40 },
+    const result = await planCommand([long.videoId], ctx);
+    expect(result).toMatchObject({ videoId: "abcdefghijk", durationLabel: "29:59", mode: "grid", total: 3 });
+    expect((result as { parts: unknown[] }).parts.slice(0, 2)).toEqual([
+      {
+        part: 1, startSec: 0, endSec: 820, readUntilSec: 820, savedNoteId: "tokens-p1",
+        startLabel: "0:00", endLabel: "13:40", readUntilLabel: "13:40",
+      },
+      {
+        part: 2, startSec: 820, endSec: 1195, readUntilSec: 1495,
+        startLabel: "13:40", endLabel: "19:55", readUntilLabel: "24:55",
+      },
     ]);
-    const result = (await planCommand([transcript.videoId], ctx)) as { source: string; parts: { title?: string }[] };
-    expect(result.source).toBe("chapters");
-    expect(result.parts.map((p) => p.title)).toEqual(["Intro", "Numbers"]);
-  });
-
-  it("asks for --cuts when there are no chapters", async () => {
-    const ctx = await setup();
-    await expect(planCommand([transcript.videoId], ctx)).rejects.toMatchObject({ code: "NEEDS_CUTS" });
   });
 
   it("fails clearly when the transcript was not fetched", async () => {
-    const ctx = createContext({ id: "catat", migrationsDir: MIGRATIONS_DIR }, makeTempHome());
-    await expect(planCommand(["abcdefghijk"], ctx)).rejects.toBeInstanceOf(CommandError);
+    await expect(planCommand(["abcdefghijk"], setup())).rejects.toBeInstanceOf(CommandError);
   });
 });
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+`plugins/catat/cli/read.test.ts`:
+
+```ts
+import { createContext } from "@eaiku/core";
+import { makeTempHome } from "@eaiku/core/testing";
+import { describe, expect, it } from "vitest";
+import { MIGRATIONS_DIR } from "../db";
+import { transcript } from "../test/fixtures";
+import { readCommand } from "./read";
+
+describe("readCommand", () => {
+  it("returns only the transcript lines inside the range", async () => {
+    const ctx = createContext({ id: "catat", migrationsDir: MIGRATIONS_DIR }, makeTempHome());
+    await ctx.storage.writeJson(`transcripts/${transcript.videoId}.json`, transcript);
+
+    const result = (await readCommand([transcript.videoId, "--from", "0:04", "--to", "0:40"], ctx)) as {
+      text: string;
+    };
+    expect(result).toMatchObject({ videoId: "abcdefghijk", from: "0:04", to: "0:40" });
+    expect(result.text).toBe("[0:04] a tokenizer splits text into small pieces each piece is mapped to a number\n");
+  });
+});
+```
+
+- [ ] **Step 7: Run the tests to verify they fail**
 
 Run: `pnpm vitest run plugins/catat/cli`
-Expected: FAIL with "Failed to resolve import ./plan".
+Expected: FAIL with "Cannot find module './plan'" and "./read".
 
-- [ ] **Step 3: Implement the shared helper**
+- [ ] **Step 8: Implement the shared helper**
 
 `plugins/catat/cli/shared.ts`:
 
@@ -2092,61 +2368,74 @@ export async function loadTranscript(ctx: PluginContext, videoIdOrUrl: string): 
 }
 ```
 
-- [ ] **Step 4: Implement `plan`**
+- [ ] **Step 9: Implement `plan` and `read`**
 
 `plugins/catat/cli/plan.ts`:
 
 ```ts
-import { parseArgs } from "node:util";
 import { CommandError, type PluginCommand } from "@eaiku/core";
-import { buildParts, snapCut, type Part } from "../lib/snap";
-import { formatTimestamp, parseTimestamp } from "../lib/time";
+import { getSeriesParts } from "../db";
+import { computePlan } from "../lib/plan";
+import { formatTimestamp } from "../lib/time";
 import { loadTranscript } from "./shared";
 
-const SNAP_WINDOW_SEC = 120;
-
 export const planCommand: PluginCommand = async (args, ctx) => {
-  const { values, positionals } = parseArgs({
-    args,
-    options: { cuts: { type: "string" } },
-    allowPositionals: true,
-  });
-  const input = positionals[0];
-  if (!input) throw new CommandError("Usage: eaiku catat plan <videoId> [--cuts 12:40,24:05]", undefined, "USAGE");
+  const input = args[0];
+  if (!input) throw new CommandError("Usage: eaiku catat plan <videoId>", undefined, "USAGE");
   const transcript = await loadTranscript(ctx, input);
-
-  let source: "cuts" | "chapters";
-  let parts: Part[];
-  if (values.cuts) {
-    source = "cuts";
-    const cuts = values.cuts.split(",").map((c) => parseTimestamp(c.trim()));
-    parts = buildParts(
-      cuts.map((c) => snapCut(transcript.segments, c, SNAP_WINDOW_SEC)),
-      transcript.durationSec,
-    );
-  } else if (transcript.chapters.length >= 2) {
-    source = "chapters";
-    parts = buildParts(
-      transcript.chapters.map((c) => c.startSec),
-      transcript.durationSec,
-    ).map((p) => ({ ...p, title: transcript.chapters.find((c) => c.startSec === p.startSec)?.title }));
-  } else {
-    throw new CommandError(
-      "This video has no chapters. Read the transcript, then pass --cuts at topic shifts (about every 10 minutes).",
-      undefined,
-      "NEEDS_CUTS",
-    );
-  }
+  const plan = computePlan(transcript, getSeriesParts(ctx.db, transcript.videoId));
 
   return {
     videoId: transcript.videoId,
-    source,
-    parts: parts.map((p) => ({ ...p, startLabel: formatTimestamp(p.startSec), endLabel: formatTimestamp(p.endSec) })),
+    title: transcript.title,
+    durationLabel: formatTimestamp(transcript.durationSec),
+    mode: plan.mode,
+    total: plan.total,
+    parts: plan.parts.map((p) => ({
+      ...p,
+      startLabel: formatTimestamp(p.startSec),
+      endLabel: formatTimestamp(p.endSec),
+      readUntilLabel: formatTimestamp(p.readUntilSec),
+    })),
   };
 };
 ```
 
-- [ ] **Step 5: Implement `fetch`**
+`plugins/catat/cli/read.ts`:
+
+```ts
+import { parseArgs } from "node:util";
+import { CommandError, type PluginCommand } from "@eaiku/core";
+import { formatTimestamp, parseTimestamp } from "../lib/time";
+import { groupLines, toTranscriptText } from "../lib/transcript";
+import { loadTranscript } from "./shared";
+
+// Returns only the transcript lines of one range, so the agent never loads a whole long video.
+export const readCommand: PluginCommand = async (args, ctx) => {
+  const { values, positionals } = parseArgs({
+    args,
+    options: { from: { type: "string" }, to: { type: "string" } },
+    allowPositionals: true,
+  });
+  const input = positionals[0];
+  if (!input) {
+    throw new CommandError("Usage: eaiku catat read <videoId> [--from m:ss] [--to m:ss]", undefined, "USAGE");
+  }
+  const transcript = await loadTranscript(ctx, input);
+  const fromSec = values.from ? parseTimestamp(values.from) : 0;
+  const toSec = values.to ? parseTimestamp(values.to) : transcript.durationSec;
+  const segments = transcript.segments.filter((s) => s.startSec >= fromSec && s.startSec < toSec);
+
+  return {
+    videoId: transcript.videoId,
+    from: formatTimestamp(fromSec),
+    to: formatTimestamp(toSec),
+    text: toTranscriptText(groupLines(segments)),
+  };
+};
+```
+
+- [ ] **Step 10: Implement `fetch`**
 
 `plugins/catat/cli/fetch.ts`:
 
@@ -2156,8 +2445,6 @@ import { formatTimestamp } from "../lib/time";
 import { groupLines, toTranscriptText, type TranscriptFile } from "../lib/transcript";
 import { parseVideoId } from "../lib/video-id";
 import { fetchCaptions, fetchChapters, fetchOEmbed, watchUrl } from "../lib/youtube";
-
-const LONG_VIDEO_SEC = 600;
 
 export const fetchCommand: PluginCommand = async (args, ctx) => {
   const input = args[0];
@@ -2184,6 +2471,7 @@ export const fetchCommand: PluginCommand = async (args, ctx) => {
     fetchedAt: new Date().toISOString(),
   };
   await ctx.storage.writeJson(`transcripts/${videoId}.json`, transcript);
+  // Human-readable copy. The agent uses `eaiku catat read` instead of this file.
   await ctx.storage.writeText(`transcripts/${videoId}.txt`, toTranscriptText(groupLines(segments)));
   const draftsDir = await ctx.storage.ensureDir("drafts");
 
@@ -2196,23 +2484,22 @@ export const fetchCommand: PluginCommand = async (args, ctx) => {
     durationLabel: formatTimestamp(durationSec),
     captionLang: "en",
     chapters: chapters.map((c) => ({ ...c, label: formatTimestamp(c.startSec) })),
-    needsPlan: durationSec > LONG_VIDEO_SEC,
     transcriptPath: ctx.storage.path(`transcripts/${videoId}.txt`),
     draftsDir,
   };
 };
 ```
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [ ] **Step 11: Run the tests to verify they pass**
 
-Run: `pnpm vitest run plugins/catat/cli && pnpm typecheck`
-Expected: PASS (4 tests), and typecheck exits 0.
+Run: `pnpm vitest run plugins/catat && pnpm typecheck && pnpm lint`
+Expected: all PASS, and typecheck and lint exit 0.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 12: Commit**
 
 ```bash
 git add -A
-git commit -m "feat(catat): add fetch and plan CLI commands"
+git commit -m "feat(catat): plan parts with a 5-minute buffer and add fetch, plan, and read commands"
 ```
 
 ---
@@ -2233,12 +2520,13 @@ import { createContext } from "@eaiku/core";
 import { makeTempHome } from "@eaiku/core/testing";
 import { describe, expect, it } from "vitest";
 import { MIGRATIONS_DIR } from "../db";
-import { makeNote, transcript } from "../test/fixtures";
+import type { TranscriptFile } from "../lib/transcript";
+import { makeLongTranscript, makeNote, transcript } from "../test/fixtures";
 import { saveCommand } from "./save";
 
-async function setup(draft: unknown) {
+async function setup(draft: unknown, t: TranscriptFile = transcript) {
   const ctx = createContext({ id: "catat", migrationsDir: MIGRATIONS_DIR }, makeTempHome());
-  await ctx.storage.writeJson(`transcripts/${transcript.videoId}.json`, transcript);
+  await ctx.storage.writeJson(`transcripts/${t.videoId}.json`, t);
   await ctx.storage.writeJson("drafts/draft.json", draft);
   return { ctx, draftPath: ctx.storage.path("drafts/draft.json") };
 }
@@ -2267,6 +2555,21 @@ describe("saveCommand", () => {
     expect(fs.existsSync(draftPath)).toBe(true);
   });
 
+  it("rejects a series part that does not match the plan", async () => {
+    const long = makeLongTranscript();
+    const base = makeNote();
+    if (base.source.type !== "youtube") throw new Error("fixture must be youtube");
+    const note = makeNote({
+      source: { ...base.source, durationSec: 1799, range: { startSec: 0, endSec: 1000 } },
+      series: { id: long.videoId, part: 1, total: 3, partTitle: "Intro" },
+    });
+    const { ctx, draftPath } = await setup(note, long);
+    await expect(saveCommand([draftPath], ctx)).rejects.toMatchObject({
+      code: "PLAN_MISMATCH",
+      message: expect.stringContaining("15:10"),
+    });
+  });
+
   it("rejects a draft with a wrong quote", async () => {
     const note = makeNote();
     note.sections[1].refs = [{ kind: "timestamp", startSec: 9, quote: "words that were never said" }];
@@ -2290,7 +2593,7 @@ describe("saveCommand", () => {
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `pnpm vitest run plugins/catat/cli/save.test.ts`
-Expected: FAIL with "Failed to resolve import ./save".
+Expected: FAIL with "Cannot find module './save'".
 
 - [ ] **Step 3: Implement**
 
@@ -2300,8 +2603,9 @@ Expected: FAIL with "Failed to resolve import ./save".
 import fs from "node:fs/promises";
 import path from "node:path";
 import { CommandError, type PluginCommand } from "@eaiku/core";
-import { indexNote } from "../db";
+import { getSeriesParts, indexNote } from "../db";
 import { checkCitations } from "../lib/citations";
+import { checkSeriesRange, computePlan } from "../lib/plan";
 import { Note } from "../schema/note";
 import { loadTranscript } from "./shared";
 
@@ -2337,6 +2641,20 @@ export const saveCommand: PluginCommand = async (args, ctx) => {
   }
 
   const transcript = await loadTranscript(ctx, note.source.videoId);
+
+  if (note.series) {
+    const part = note.series.part;
+    const plan = computePlan(transcript, getSeriesParts(ctx.db, note.series.id, note.id));
+    const problem = checkSeriesRange(note, plan);
+    if (problem) {
+      throw new CommandError(
+        problem,
+        { plannedPart: plan.parts.find((p) => p.part === part) ?? null },
+        "PLAN_MISMATCH",
+      );
+    }
+  }
+
   const errors = checkCitations(note, transcript);
   if (errors.length > 0) {
     throw new CommandError(
@@ -2360,13 +2678,13 @@ export const saveCommand: PluginCommand = async (args, ctx) => {
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `pnpm vitest run plugins/catat/cli && pnpm typecheck`
-Expected: PASS (8 tests in `cli/`), and typecheck exits 0.
+Expected: PASS (all tests in `cli/`), and typecheck exits 0.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add -A
-git commit -m "feat(catat): add save command with schema and citation checks"
+git commit -m "feat(catat): add save command with schema, plan, and citation checks"
 ```
 
 ---
@@ -2455,6 +2773,7 @@ Expected: PASS (1 test).
 import type { EaikuPlugin } from "@eaiku/core";
 import { fetchCommand } from "./cli/fetch";
 import { planCommand } from "./cli/plan";
+import { readCommand } from "./cli/read";
 import { reindexCommand } from "./cli/reindex";
 import { saveCommand } from "./cli/save";
 import { MIGRATIONS_DIR } from "./db";
@@ -2493,6 +2812,7 @@ export const catat: EaikuPlugin = {
   commands: {
     fetch: fetchCommand,
     plan: planCommand,
+    read: readCommand,
     save: saveCommand,
     reindex: reindexCommand,
   },
@@ -2558,7 +2878,7 @@ describe("run", () => {
   it("rejects an unknown command and lists the real ones", async () => {
     await expect(run(["catat", "nope"], makeTempHome())).rejects.toMatchObject({
       code: "USAGE",
-      message: expect.stringContaining("fetch, plan, save, reindex"),
+      message: expect.stringContaining("fetch, plan, read, save, reindex"),
     });
   });
 
@@ -2774,25 +3094,40 @@ cd <eaiku-repo>/packages/cli && npm link
 
 ## 1. Fetch
 
-Run `eaiku catat fetch "<url>"`. Keep `title`, `durationSec`, `chapters`, `needsPlan`, `transcriptPath`, and `draftsDir` from the output.
+Run `eaiku catat fetch "<url>"`. Keep `videoId`, `title`, `durationLabel`, and `draftsDir` from the output.
 
 On error, explain it in one or two sentences and stop:
 - `NO_CAPTIONS`: the video has no captions.
 - `NO_ENGLISH_CAPTIONS`: show the available languages from the message. v0.1 supports English only.
 - `BAD_URL`, `BLOCKED`, `EMPTY_TRANSCRIPT`, `FETCH_FAILED`: show the message.
 
-## 2. Decide the parts
+## 2. Plan
 
-- If the user gave `--from`/`--to`: one note for that range. Continue to step 3.
-- If `needsPlan` is false: one note for the whole video (`0` to `durationSec`). Continue to step 3.
-- Otherwise, plan:
-  1. If `chapters` has 2 or more items, run `eaiku catat plan <videoId>`.
-  2. If not, read the transcript file. Find topic shifts about every 10 minutes (parts of 5–15 minutes). Run `eaiku catat plan <videoId> --cuts <m:ss>,<m:ss>,...`. Give each part a short title yourself.
-  3. Show the plan as a numbered list: `N. start–end  title`. Ask: "Make notes for: all / 1,2 / 1-3?" Suggest 3 parts or fewer for each run. Wait for the answer.
+- If the user gave `--from`/`--to`: make one note for that range, with **no** `series`. Go to step 3.
+- Otherwise run `eaiku catat plan <videoId>`. Never read the whole transcript to plan.
+  - `mode: "single"`: make one note for `parts[0]`, with **no** `series`. Go to step 3.
+  - `mode: "chapters"` or `"grid"`: show the plan and wait for the user's choice:
+    ```
+    "<title>" is <durationLabel> long. I split it into <total> parts:
+      1. 0:00–10:10  <title if any>  ✓ saved
+      2. 10:10–19:55
+      ...
+    Make notes for: all / 1,2 / 1-3?
+    ```
+    Mark parts that have `savedNoteId` with ✓ and skip them unless the user asks to redo them. If there are more than 12 parts, show the first 10 and the last one. Suggest 3 parts or fewer for each run.
 
 ## 3. Write each note
 
-For each chosen part, read **only** the transcript lines inside the part's range. Then write the draft JSON with the Write tool to `<draftsDir>/<noteId>.json`.
+Do the chosen parts **one at a time, in order**. For each part:
+
+1. Read only this part: `eaiku catat read <videoId> --from <startLabel> --to <readUntilLabel>`. (For `--from`/`--to` notes, use the user's range.)
+2. Set `source.range.startSec` to the part's `startSec`.
+3. Set `source.range.endSec`:
+   - `grid` mode: where the topic really ends. Pick the `[m:ss]` of the first line of the next topic, at or after `endSec` and not after `readUntilSec`. If the topic is still going at `readUntilSec`, use `readUntilSec`.
+   - `chapters` and `single` modes: the part's `endSec`.
+4. Set `series` for `chapters` and `grid` parts: `{ "id": "<videoId>", "part": <part>, "total": <total>, "partTitle": "<chapter title, or a short title you choose>" }`.
+5. Write the draft with the Write tool to `<draftsDir>/<noteId>.json`, then save it (step 4).
+6. Before the next part, run `eaiku catat plan <videoId>` again. The saved end moves the start of the next part.
 
 ### Writing guide: explain, do not compress
 
@@ -2845,7 +3180,7 @@ Styles:
 
 Run `eaiku catat save "<draft path>"`.
 
-- `SCHEMA_INVALID` or `CITATIONS_INVALID`: read `details`, fix **only** the listed problems in the draft, and run `save` again. After **3** failed attempts, stop and show the remaining errors to the user.
+- `SCHEMA_INVALID`, `PLAN_MISMATCH`, or `CITATIONS_INVALID`: read the message and `details`, fix **only** the listed problems in the draft, and run `save` again. After **3** failed attempts, stop and show the remaining errors to the user.
 - Success: tell the user the note title and the `url` from the output. For a series, list every saved part.
 ````
 
@@ -2921,13 +3256,23 @@ Expected: all exit 0.
 
 - [ ] **Step 2: Short video (≤ 10 min)**
 
-In Claude Code: `/catat https://www.youtube.com/watch?v=aircAruvnKk`
-Expected: no plan step. One note is saved. Check: `ls ~/eaiku/catat/notes/` shows the note folder.
+Pick a video of 10 minutes or less. Check its length first with `pnpm tsx plugins/catat/scripts/preview.ts '<url>' 1`.
+In Claude Code: `/catat '<url>'`
+Expected: `plan` returns `mode: "single"`, there is no plan question, and one note is saved. Check: `ls ~/eaiku/catat/notes/` shows the note folder.
 
 - [ ] **Step 3: Long video with chapters**
 
 In Claude Code: `/catat https://www.youtube.com/watch?v=zjkBMFhNj_g`. Answer `1` to the plan question.
-Expected: a plan based on chapters. One part note with `series.part = 1` is saved.
+Expected: `mode: "chapters"` with 21 parts and the chapter titles. One part note with `series.part = 1` is saved.
+
+- [ ] **Step 3b: Long video without chapters (grid and buffer)**
+
+In Claude Code: `/catat https://www.youtube.com/watch?v=reDRM0tqhNs` (12:38:38, no chapters). Answer `1-2`.
+Expected:
+- The plan shows about 76 parts (the first 10 and the last one) with no titles.
+- Part 1 ends between its planned end and its `readUntilLabel` (at most 5 minutes later).
+- The second `plan` run shows part 1 with ✓, and part 2 starts exactly at part 1's saved end.
+- Check: `sqlite3 ~/eaiku/eaiku.db "SELECT part, start_sec, end_sec FROM catat_notes WHERE series_id = 'reDRM0tqhNs' ORDER BY part"` shows 2 rows, and row 2 `start_sec` equals row 1 `end_sec`.
 
 - [ ] **Step 4: Manual range**
 
@@ -2937,11 +3282,11 @@ Expected: one note with `source.range` = `{ startSec: 720, endSec: 1440 }`.
 - [ ] **Step 5: Check the index**
 
 Run: `eaiku reindex`
-Expected: `{"catat": {"indexed": 3, "skipped": []}}`.
+Expected: `{"catat": {"indexed": 5, "skipped": []}}`.
 
-- [ ] **Step 6: Read the three notes**
+- [ ] **Step 6: Read the five notes**
 
-Open each `note.json`. Check by eye: the hook is not "In this video…", the sections explain *why*, and the analogies fit. Write down any problems as prompt changes for `SKILL.md`, and apply them before you commit.
+Open each `note.json`. For the grid parts, check that each part ends at a natural topic break. Check by eye: the hook is not "In this video…", the sections explain *why*, and the analogies fit. Write down any problems as prompt changes for `SKILL.md`, and apply them before you commit.
 
 - [ ] **Step 7: Record the results and commit**
 
