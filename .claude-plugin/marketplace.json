@@ -1,0 +1,12 @@
+{
+  "name": "eaiku",
+  "description": "Plugins for eaiku, a local-first AI hub where your own agent does the work.",
+  "owner": { "name": "stevenstacks" },
+  "plugins": [
+    {
+      "name": "catat",
+      "source": "./plugins/catat/claude",
+      "description": "Turn YouTube videos into eaiku notes that explain, not compress."
+    }
+  ]
+}
