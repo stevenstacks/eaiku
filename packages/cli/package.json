@@ -1,0 +1,14 @@
+{
+  "name": "@eaiku/cli",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "eaiku": "./bin/eaiku.js"
+  },
+  "dependencies": {
+    "@eaiku/core": "workspace:*",
+    "@eaiku/plugin-catat": "workspace:*",
+    "tsx": "^4.23.15"
+  }
+}
