@@ -23,22 +23,29 @@ export const transcript: TranscriptFile = {
 
 const ref = (startSec: number, quote: string) => ({ kind: "timestamp" as const, startSec, quote });
 
+type YoutubeSource = Extract<Note["source"], { type: "youtube" }>;
+
+export function youtubeSource(overrides: Partial<YoutubeSource> = {}): YoutubeSource {
+  return {
+    type: "youtube",
+    url: transcript.url,
+    videoId: transcript.videoId,
+    title: transcript.title,
+    channel: transcript.channel,
+    durationSec: 80,
+    captionLang: "en",
+    range: { startSec: 0, endSec: 80 },
+    ...overrides,
+  };
+}
+
 export function makeNote(overrides: Partial<Note> = {}): Note {
   return {
     schemaVersion: 1,
     id: "2026-09-28-tokens-101",
     createdAt: "2026-09-28T10:00:00.000Z",
     style: "friendly",
-    source: {
-      type: "youtube",
-      url: transcript.url,
-      videoId: transcript.videoId,
-      title: transcript.title,
-      channel: transcript.channel,
-      durationSec: 80,
-      captionLang: "en",
-      range: { startSec: 0, endSec: 80 },
-    },
+    source: youtubeSource(),
     title: "Tokens 101: how models read text",
     hook: "Your chatbot cannot see letters. Here is why that matters.",
     keyTakeaway: "Models read numbers that stand for pieces of text, not letters.",

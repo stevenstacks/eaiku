@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { makeNote, transcript } from "../test/fixtures";
+import { makeNote, transcript, youtubeSource } from "../test/fixtures";
 import { checkCitations } from "./citations";
 
 describe("checkCitations", () => {
@@ -22,18 +22,14 @@ describe("checkCitations", () => {
   });
 
   it("reports a timestamp outside the note range", () => {
-    const base = makeNote();
-    if (base.source.type !== "youtube") throw new Error("fixture must be youtube");
-    const note = makeNote({ source: { ...base.source, range: { startSec: 0, endSec: 30 } } });
+    const note = makeNote({ source: youtubeSource({ range: { startSec: 0, endSec: 30 } }) });
     const errors = checkCitations(note, transcript);
     expect(errors.map((e) => e.path)).toEqual(["sections[2].refs[0]", "concepts[2].refs[0]"]);
     expect(errors[0].message).toContain("outside the note range 0:00–0:30");
   });
 
   it("reports a range longer than the video", () => {
-    const base = makeNote();
-    if (base.source.type !== "youtube") throw new Error("fixture must be youtube");
-    const note = makeNote({ source: { ...base.source, range: { startSec: 0, endSec: 500 } } });
+    const note = makeNote({ source: youtubeSource({ range: { startSec: 0, endSec: 500 } }) });
     expect(checkCitations(note, transcript)[0]).toEqual({
       path: "source.range",
       message: expect.stringContaining("must be inside the video"),
